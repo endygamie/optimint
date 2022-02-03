@@ -3,6 +3,7 @@ package client
 import (
 	"context"
 	crand "crypto/rand"
+	"fmt"
 	"math/rand"
 	"testing"
 	"time"
@@ -331,6 +332,61 @@ func TestUnconfirmedTxsLimit(t *testing.T) {
 	assert.Len(txRes.Txs, limit)
 	assert.Contains(txRes.Txs, tx1)
 	assert.NotContains(txRes.Txs, tx2)
+}
+
+func TestEventIndexing(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	mockApp := &mocks.Application{}
+	mockApp.On("InitChain", mock.Anything).Return(abci.ResponseInitChain{})
+	key, _, _ := crypto.GenerateEd25519Key(crand.Reader)
+	node, err := node.NewNode(context.Background(), config.NodeConfig{
+		DALayer:    "mock",
+		Aggregator: true,
+		BlockManagerConfig: config.BlockManagerConfig{
+			BlockTime: 1 * time.Second,
+		}},
+		key, proxy.NewLocalClientCreator(mockApp),
+		&tmtypes.GenesisDoc{ChainID: "test"},
+		log.TestingLogger())
+	require.NoError(err)
+	require.NotNil(node)
+
+	rpc := NewClient(node)
+	require.NotNil(rpc)
+	mockApp.On("BeginBlock", mock.Anything).Return(abci.ResponseBeginBlock{})
+	mockApp.On("EndBlock", mock.Anything).Return(abci.ResponseEndBlock{})
+	mockApp.On("Commit", mock.Anything).Return(abci.ResponseCommit{})
+	const evType = "ethereum_tx"
+	const evKey = "ethereumTxHash"
+	const evValue = "RLP encoded Keccak hash"
+	mockApp.On("DeliverTx", mock.Anything).Return(abci.ResponseDeliverTx{
+		Events: []abci.Event{{
+			Type: evType,
+			Attributes: []abci.EventAttribute{{
+				Key:   []byte(evKey),
+				Value: []byte(evValue),
+				Index: true,
+			}},
+		}},
+	})
+	mockApp.On("CheckTx", mock.Anything).Return(abci.ResponseCheckTx{})
+
+	err = rpc.node.Start()
+	require.NoError(err)
+
+	tx1 := tmtypes.Tx("tx1")
+
+	res, err := rpc.BroadcastTxCommit(context.Background(), tx1)
+	assert.NoError(err)
+	assert.NotNil(res)
+
+	time.Sleep(1 * time.Second)
+
+	txs, err := rpc.TxSearch(context.Background(), fmt.Sprintf("%s.%s='%s'", evType, evKey, evValue), false, nil, nil, "asc")
+	assert.NoError(err)
+	assert.EqualValues(1, txs.TotalCount)
 }
 
 // copy-pasted from store/store_test.go
